@@ -52,7 +52,7 @@ createApp({
     const token=ref(localStorage.getItem('contractlab_token')||'');
     const user=ref(localStorage.getItem('contractlab_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
-    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({});
+    const contracts=ref([]), batches=ref([]), buffers=ref([]), recon=ref({}), events=ref([]);
     const form=ref({subject:'订单入站', payload_fields:'order_id,amount'});
     const nav=['契约版本','入站校验','双写缓冲','契约对账'];
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
@@ -81,6 +81,15 @@ createApp({
       buffers.value=Array.isArray(u.items)?u.items:[];
       const q=await loadJson('/api/reconcile'); if(q===null) return;
       recon.value=q&&typeof q==='object'?q:{};
+      const e=await loadJson('/api/cutoff/events'); if(e===null) return;
+      events.value=Array.isArray(e.items)?e.items:[];
+    }
+    async function disable(ctr){
+      actionErr.value='';
+      const r=await fetch('/api/contracts/'+ctr.id+'/disable',{method:'POST',headers:auth()});
+      const j=await r.json().catch(()=>({}));
+      actionErr.value=r.ok?('已停用：'+j.version+'（批次水位 '+j.watermark+'，此后入站切断）'):(j.detail||'停用失败');
+      await refresh();
     }
     async function validate(){
       actionErr.value='';
@@ -89,7 +98,7 @@ createApp({
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,form,actionErr,login,logout,validate};
+    return {token,user,username,password,err,tab,nav,contracts,batches,buffers,recon,events,form,actionErr,login,logout,validate,disable};
   },
   template:`
   <div v-if="!token" class="login">
@@ -109,10 +118,12 @@ createApp({
     <div class="steps"><button v-for="(n,i) in nav" :key="n" :class="{on:tab===i}" @click="tab=i">{{i+1}}. {{n}}</button></div>
     <div class="card" v-show="tab===0">
       <h2>现行契约</h2>
-      <table><thead><tr><th>版本</th><th>主题</th><th>模式 / 轨</th><th>状态</th><th>必填字段</th></tr></thead>
+      <table><thead><tr><th>版本</th><th>主题</th><th>模式 / 轨</th><th>状态</th><th>必填字段</th><th>操作</th></tr></thead>
       <tbody><tr v-for="c in contracts" :key="c.id">
         <td>{{c.version}}</td><td>{{c.subject}}</td><td>{{c.mode}} / {{c.track}}</td><td>{{c.status}}</td><td>{{c.required_fields}}</td>
+        <td><button v-if="c.track==='正式' && c.status==='启用'" class="ghost" @click="disable(c)">停用</button></td>
       </tr></tbody></table>
+      <div class="err">{{actionErr}}</div>
     </div>
     <div class="pair" v-show="tab===1">
       <div class="card">
@@ -140,6 +151,12 @@ createApp({
     <div class="card" v-show="tab===3">
       <h2>契约对账摘要</h2>
       <p>入站 {{recon.ingress_total}} · 通过 {{recon.passed}} · 缓冲 {{recon.buffered}} · 拒收 {{recon.rejected}} · 缓冲行 {{recon.buffer_rows}} · 对齐 {{recon.aligned}}</p>
+      <h2>切断事件</h2>
+      <table><thead><tr><th>事件</th><th>版本</th><th>说明</th><th>时间</th></tr></thead>
+      <tbody><tr v-for="e in (events||[]).slice(0,10)" :key="e.id">
+        <td><span class="stamp" :class="{bad:e.kind!=='停用切断'}">{{e.kind}}</span></td>
+        <td>{{e.version||'—'}}</td><td>{{e.detail}}</td><td>{{e.created_at}}</td>
+      </tr></tbody></table>
     </div>
   </div>`
 }).mount('#app');

@@ -1,5 +1,5 @@
 
-import hashlib, secrets, sqlite3
+import hashlib, re, secrets, sqlite3, threading
 from pathlib import Path
 from fastapi import Header, HTTPException
 from pydantic import BaseModel
@@ -9,6 +9,33 @@ DATA = ROOT / "data"
 DB_PATH = DATA / "app.db"
 FRONTEND = ROOT / "frontend"
 SESSIONS: dict[str, str] = {}
+
+# —— 停用切断（甲路径：校验前条件更新检查启用态，停用则拒绝零写入；不混用乙路径指针快照）——
+CUTOFF_LEDGER = ROOT / "停用切断簿.md"
+CUTOFF_PATH = "甲"
+
+class CutoffRWLock:
+    """停用与入站两名值班撞车须排队：入站共享、停用互斥；后到只记停用争用。"""
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+    def acquire_read(self):
+        with self._cond:
+            if self._writer: return False
+            self._readers += 1; return True
+    def release_read(self):
+        with self._cond:
+            self._readers -= 1; self._cond.notify_all()
+    def acquire_write(self):
+        with self._cond:
+            if self._writer or self._readers: return False
+            self._writer = True; return True
+    def release_write(self):
+        with self._cond:
+            self._writer = False; self._cond.notify_all()
+
+CUTOFF_RW = CutoffRWLock()
 
 def connect():
     DATA.mkdir(parents=True, exist_ok=True)
@@ -77,6 +104,13 @@ def init_db():
           batch_id INTEGER NOT NULL,
           reason TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS cutoff_events(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL,
+          version TEXT,
+          detail TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         """)
         if conn.execute("SELECT COUNT(*) c FROM contracts").fetchone()["c"] == 0:
             conn.execute("INSERT INTO contracts(version,subject,mode,track,status,required_fields) VALUES (?,?,?,?,?,?)",
@@ -89,6 +123,28 @@ def init_db():
 @app.on_event("startup")
 def _s():
     init_db()
+
+def record_cutoff_event(kind: str, version: str | None = None, detail: str = "", conn=None):
+    now = datetime.now().isoformat(timespec="seconds")
+    if conn is not None:
+        conn.execute("INSERT INTO cutoff_events(kind,version,detail,created_at) VALUES (?,?,?,?)",
+                     (kind, version, detail, now))
+        return
+    with connect() as c:
+        c.execute("INSERT INTO cutoff_events(kind,version,detail,created_at) VALUES (?,?,?,?)",
+                  (kind, version, detail, now))
+
+def check_cutoff_ledger():
+    """偏离停用切断簿则拒绝并记切断偏了。"""
+    declared = None
+    try:
+        m = re.search(r"路径\s*[:：]\s*([甲乙])", CUTOFF_LEDGER.read_text(encoding="utf-8"))
+        declared = m.group(1) if m else None
+    except OSError:
+        declared = None
+    if declared != CUTOFF_PATH:
+        record_cutoff_event("切断偏了", detail=f"切断簿登记「{declared or '缺失'}」≠实现「{CUTOFF_PATH}」，拒绝")
+        raise HTTPException(409, "切断偏了：偏离停用切断簿，拒绝")
 
 @app.get("/api/health")
 def health():
@@ -110,6 +166,38 @@ def contracts(authorization: str | None = Header(default=None)):
     with connect() as c:
         return {"items":[dict(r) for r in c.execute("SELECT * FROM contracts ORDER BY id").fetchall()]}
 
+@app.post("/api/contracts/{contract_id}/disable")
+def disable_contract(contract_id: int, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    check_cutoff_ledger()
+    if not CUTOFF_RW.acquire_write():
+        record_cutoff_event("停用争用", detail="停用值班与入站撞车，后到只记争用")
+        raise HTTPException(409, "停用争用：与入站值班撞车，请重试")
+    try:
+        with connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT * FROM contracts WHERE id=?", (contract_id,)).fetchone()
+            if not row:
+                raise HTTPException(404, "契约不存在")
+            if row["track"] != "正式":
+                raise HTTPException(409, "仅正式轨契约执行停用切断")
+            # 启用态条件更新：仅 启用→停用 一次命中，零命中即冲突
+            cur = c.execute("UPDATE contracts SET status='停用' WHERE id=? AND status='启用'", (contract_id,))
+            if cur.rowcount == 0:
+                raise HTTPException(409, "契约已停用")
+            watermark = c.execute("SELECT COALESCE(MAX(id),0) m FROM ingress_batches").fetchone()["m"]
+            record_cutoff_event("停用切断", version=row["version"],
+                                detail=f"甲路径：正式契约停用于批次水位 {watermark}，此后入站拒绝零写入", conn=c)
+            return {"version": row["version"], "status": "停用", "watermark": watermark}
+    finally:
+        CUTOFF_RW.release_write()
+
+@app.get("/api/cutoff/events")
+def cutoff_events(authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    with connect() as c:
+        return {"items":[dict(r) for r in c.execute("SELECT * FROM cutoff_events ORDER BY id DESC").fetchall()]}
+
 class IngressIn(BaseModel):
     subject: str
     payload_fields: str  # comma fields present
@@ -117,26 +205,40 @@ class IngressIn(BaseModel):
 @app.post("/api/ingress/validate")
 def validate(body: IngressIn, authorization: str | None = Header(default=None)):
     require_user(authorization)
-    fields = {x.strip() for x in body.payload_fields.split(",") if x.strip()}
-    with connect() as c:
-        ctr = c.execute("SELECT * FROM contracts WHERE subject=? AND track='正式' AND status='启用' ORDER BY id DESC LIMIT 1", (body.subject,)).fetchone()
-        if not ctr:
-            raise HTTPException(404, "无启用正式契约")
-        need = {x.strip() for x in ctr["required_fields"].split(",") if x.strip()}
-        missing = sorted(need - fields)
-        now = datetime.now().isoformat(timespec="seconds")
-        if missing:
-            if ctr["mode"] == "兼容":
+    check_cutoff_ledger()
+    if not CUTOFF_RW.acquire_read():
+        record_cutoff_event("停用争用", detail="入站校验与停用值班撞车，后到只记争用")
+        raise HTTPException(409, "停用争用：与停用值班撞车，请重试")
+    try:
+        fields = {x.strip() for x in body.payload_fields.split(",") if x.strip()}
+        with connect() as c:
+            c.execute("BEGIN IMMEDIATE")
+            ctr = c.execute("SELECT * FROM contracts WHERE subject=? AND track='正式' ORDER BY id DESC LIMIT 1", (body.subject,)).fetchone()
+            if not ctr:
+                raise HTTPException(404, "无启用正式契约")
+            if ctr["status"] != "启用":
+                raise HTTPException(409, "正式契约已停用，切断入站")
+            # 甲路径切断支：校验前条件更新复核启用态，停用则拒绝零写入
+            guard = c.execute("UPDATE contracts SET status=status WHERE id=? AND status='启用'", (ctr["id"],))
+            if guard.rowcount == 0:
+                raise HTTPException(409, "正式契约已停用，切断入站")
+            need = {x.strip() for x in ctr["required_fields"].split(",") if x.strip()}
+            missing = sorted(need - fields)
+            now = datetime.now().isoformat(timespec="seconds")
+            if missing:
+                if ctr["mode"] == "兼容":
+                    cur = c.execute("INSERT INTO ingress_batches(subject,payload_fields,contract_version,result,detail,created_at) VALUES (?,?,?,?,?,?)",
+                                    (body.subject, body.payload_fields, ctr["version"], "缓冲", "缺字段:"+ ",".join(missing), now))
+                    c.execute("INSERT INTO buffers(batch_id,reason) VALUES (?,?)", (cur.lastrowid, "缺字段进双写缓冲"))
+                    return {"result":"缓冲", "version": ctr["version"], "missing": missing, "batch_id": cur.lastrowid}
                 cur = c.execute("INSERT INTO ingress_batches(subject,payload_fields,contract_version,result,detail,created_at) VALUES (?,?,?,?,?,?)",
-                                (body.subject, body.payload_fields, ctr["version"], "缓冲", "缺字段:"+ ",".join(missing), now))
-                c.execute("INSERT INTO buffers(batch_id,reason) VALUES (?,?)", (cur.lastrowid, "缺字段进双写缓冲"))
-                return {"result":"缓冲", "version": ctr["version"], "missing": missing, "batch_id": cur.lastrowid}
+                                (body.subject, body.payload_fields, ctr["version"], "拒收", "缺字段:"+ ",".join(missing), now))
+                return {"result":"拒收", "version": ctr["version"], "missing": missing, "batch_id": cur.lastrowid}
             cur = c.execute("INSERT INTO ingress_batches(subject,payload_fields,contract_version,result,detail,created_at) VALUES (?,?,?,?,?,?)",
-                            (body.subject, body.payload_fields, ctr["version"], "拒收", "缺字段:"+ ",".join(missing), now))
-            return {"result":"拒收", "version": ctr["version"], "missing": missing, "batch_id": cur.lastrowid}
-        cur = c.execute("INSERT INTO ingress_batches(subject,payload_fields,contract_version,result,detail,created_at) VALUES (?,?,?,?,?,?)",
-                        (body.subject, body.payload_fields, ctr["version"], "通过", "字段齐全", now))
-        return {"result":"通过", "version": ctr["version"], "batch_id": cur.lastrowid}
+                            (body.subject, body.payload_fields, ctr["version"], "通过", "字段齐全", now))
+            return {"result":"通过", "version": ctr["version"], "batch_id": cur.lastrowid}
+    finally:
+        CUTOFF_RW.release_read()
 
 @app.get("/api/ingress")
 def ingress(authorization: str | None = Header(default=None)):

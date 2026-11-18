@@ -9,6 +9,7 @@ COPY backend/ ./backend/
 COPY frontend/ ./frontend/
 COPY tests/ ./tests/
 COPY pytest.ini .
+COPY 停用切断簿.md ./
 
 RUN mkdir -p /app/data
 
